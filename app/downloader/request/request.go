@@ -1,6 +1,8 @@
 package request
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -28,6 +30,8 @@ type Request struct {
 	Temp          Temp            //临时数据
 	TempIsJson    map[string]bool //将Temp中以JSON存储的字段标记为true，自动设置，禁止人为填写
 	Priority      int             //指定调度优先级，默认为0（最小优先级为0）
+	reEnqueues    int             //重复入队次数
+	MaxEnqueues   int             //最大重复入队次数
 	Reloadable    bool            //是否允许重复该链接下载
 	//Surfer下载器内核ID
 	//0为Surf高并发下载器，各种控制功能齐全
@@ -49,6 +53,8 @@ const (
 const (
 	SURF_ID    = 0 // 默认的surf下载内核（Go原生），此值不可改动
 	PHANTOM_ID = 1 // 备用的phantomjs下载内核，一般不使用（效率差，头信息支持不完善）
+	Chrome_ID  = 2 // 备用的chromedp下载模拟器，一般不使用（效率差，头信息支持不完善，不支持下载文件）
+	Selenium_ID = 3
 )
 
 // 发送请求前的准备工作，设置一系列默认值
@@ -68,9 +74,8 @@ func (self *Request) Prepare() error {
 	URL, err := url.Parse(self.Url)
 	if err != nil {
 		return err
-	} else {
-		self.Url = URL.String()
 	}
+	self.Url = URL.String()
 
 	if self.Method == "" {
 		self.Method = "GET"
@@ -106,7 +111,7 @@ func (self *Request) Prepare() error {
 		self.Priority = 0
 	}
 
-	if self.DownloaderID < SURF_ID || self.DownloaderID > PHANTOM_ID {
+	if self.DownloaderID < SURF_ID || self.DownloaderID > Selenium_ID {
 		self.DownloaderID = SURF_ID
 	}
 
@@ -126,6 +131,20 @@ func UnSerialize(s string) (*Request, error) {
 	return req, json.Unmarshal([]byte(s), req)
 }
 
+func (self *Request) CanEnqueue() bool{
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
+	self.reEnqueues++
+
+	if ! self.IsReloadable() || self.reEnqueues > self.MaxEnqueues {
+
+		return false
+	}
+
+	return true
+}
+
 // 序列化
 func (self *Request) Serialize() string {
 	for k, v := range self.Temp {
@@ -139,7 +158,8 @@ func (self *Request) Serialize() string {
 // 请求的唯一识别码
 func (self *Request) Unique() string {
 	if self.unique == "" {
-		self.unique = util.MakeHash(self.Spider + self.Rule + self.Url + self.Method)
+		block := md5.Sum([]byte(self.Spider + self.Rule + self.Url + self.Method))
+		self.unique = hex.EncodeToString(block[:])
 	}
 	return self.unique
 }
@@ -157,10 +177,12 @@ func (self *Request) GetUrl() string {
 	return self.Url
 }
 
+// 获取Http请求的方法名称 (注意这里不是指Http GET方法)
 func (self *Request) GetMethod() string {
 	return self.Method
 }
 
+// 设定Http请求方法的类型
 func (self *Request) SetMethod(method string) *Request {
 	self.Method = strings.ToUpper(method)
 	return self

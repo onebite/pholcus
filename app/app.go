@@ -3,10 +3,8 @@
 package app
 
 import (
-	"fmt"
 	"io"
 	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,7 +124,7 @@ func (self *Logic) LogGoOn() App {
 func (self *Logic) GetAppConf(k ...string) interface{} {
 	defer func() {
 		if err := recover(); err != nil {
-			logs.Log.Error(fmt.Sprintf("%v", err))
+			logs.Log.Error("%v", err)
 		}
 	}()
 	if len(k) == 0 {
@@ -141,22 +139,20 @@ func (self *Logic) GetAppConf(k ...string) interface{} {
 func (self *Logic) SetAppConf(k string, v interface{}) App {
 	defer func() {
 		if err := recover(); err != nil {
-			logs.Log.Error(fmt.Sprintf("%v", err))
+			logs.Log.Error("%v", err)
 		}
 	}()
 	if k == "Limit" && v.(int64) <= 0 {
 		v = int64(spider.LIMIT)
+	} else if k == "DockerCap" && v.(int) < 1 {
+		v = int(1)
 	}
-
 	acv := reflect.ValueOf(self.AppConf).Elem()
 	key := strings.Title(k)
 	if acv.FieldByName(key).CanSet() {
 		acv.FieldByName(key).Set(reflect.ValueOf(v))
 	}
 
-	if k == "DockerCap" {
-		cache.AutoDockerQueueCap()
-	}
 	return self
 }
 
@@ -176,6 +172,7 @@ func (self *Logic) Init(mode int, port int, master string, w ...io.Writer) App {
 
 	switch self.AppConf.Mode {
 	case status.SERVER:
+		logs.Log.EnableStealOne(false)
 		if self.checkPort() {
 			logs.Log.Informational("                                                                                               ！！当前运行模式为：[ 服务器 ] 模式！！")
 			self.Teleport.SetAPI(distribute.MasterApi(self)).Server(":" + strconv.Itoa(self.AppConf.Port))
@@ -187,9 +184,11 @@ func (self *Logic) Init(mode int, port int, master string, w ...io.Writer) App {
 			self.Teleport.SetAPI(distribute.SlaveApi(self)).Client(self.AppConf.Master, ":"+strconv.Itoa(self.AppConf.Port))
 			// 开启节点间log打印
 			self.canSocketLog = true
+			logs.Log.EnableStealOne(true)
 			go self.socketLog()
 		}
 	case status.OFFLINE:
+		logs.Log.EnableStealOne(false)
 		logs.Log.Informational("                                                                                               ！！当前运行模式为：[ 单机 ] 模式！！")
 		return self
 	default:
@@ -322,12 +321,20 @@ func (self *Logic) PauseRecover() {
 
 // Offline 模式下中途终止任务
 func (self *Logic) Stop() {
-	// 不可颠倒停止的顺序
-	self.setStatus(status.STOP)
-	self.CrawlerPool.Stop()
-	scheduler.Stop()
+	if self.status == status.STOPPED {
+		return
+	}
+	if self.status != status.STOP {
+		// 不可颠倒停止的顺序
+		self.setStatus(status.STOP)
+		// println("scheduler.Stop()")
+		scheduler.Stop()
+		// println("self.CrawlerPool.Stop()")
+		self.CrawlerPool.Stop()
+	}
+	// println("wait self.IsStopped()")
 	for !self.IsStopped() {
-		runtime.Gosched()
+		time.Sleep(time.Second)
 	}
 }
 
@@ -460,7 +467,7 @@ ReStartLabel:
 		return nil
 	}
 	if self.CountNodes() == 0 && self.TaskJar.Len() == 0 {
-		time.Sleep(5e7)
+		time.Sleep(time.Second)
 		goto ReStartLabel
 	}
 
@@ -470,7 +477,7 @@ ReStartLabel:
 			if self.CountNodes() == 0 {
 				goto ReStartLabel
 			}
-			time.Sleep(5e7)
+			time.Sleep(time.Second)
 		}
 	}
 	return self.TaskJar.Pull()
@@ -519,7 +526,7 @@ func (self *Logic) exec() {
 	logs.Log.Informational(" *     执行任务总数(任务数[*自定义配置数])为 %v 个\n", count)
 	logs.Log.Informational(" *     采集引擎池容量为 %v\n", crawlerCap)
 	logs.Log.Informational(" *     并发协程最多 %v 个\n", self.AppConf.ThreadNum)
-	logs.Log.Informational(" *     随机停顿区间为 %v~%v 毫秒\n", self.AppConf.Pausetime/2, self.AppConf.Pausetime*2)
+	logs.Log.Informational(" *     默认随机停顿 %v~%v 毫秒\n", self.AppConf.Pausetime/2, self.AppConf.Pausetime*2)
 	logs.Log.App(" *                                                                                                 —— 开始抓取，请耐心等候 ——")
 	logs.Log.Informational(` *********************************************************************************************************************************** `)
 
@@ -543,7 +550,7 @@ func (self *Logic) goRun(count int) {
 	for i = 0; i < count && self.Status() != status.STOP; i++ {
 	pause:
 		if self.IsPause() {
-			time.Sleep(1e9)
+			time.Sleep(time.Second)
 			goto pause
 		}
 		// 从爬行队列取出空闲蜘蛛，并发执行
@@ -553,7 +560,11 @@ func (self *Logic) goRun(count int) {
 				// 执行并返回结果消息
 				c.Init(self.SpiderQueue.GetByIndex(i)).Run()
 				// 任务结束后回收该蜘蛛
-				self.CrawlerPool.Free(c)
+				self.RWMutex.RLock()
+				if self.status != status.STOP {
+					self.CrawlerPool.Free(c)
+				}
+				self.RWMutex.RUnlock()
 			}(i, c)
 		}
 	}
@@ -561,6 +572,7 @@ func (self *Logic) goRun(count int) {
 	for ii := 0; ii < i; ii++ {
 		s := <-cache.ReportChan
 		if (s.DataNum == 0) && (s.FileNum == 0) {
+			logs.Log.App(" *     [任务小计：%s | KEYIN：%s]   无采集结果，用时 %v！\n", s.SpiderName, s.Keyin, s.Time)
 			continue
 		}
 		logs.Log.Informational(" * ")
@@ -653,7 +665,6 @@ func (self *Logic) setAppConf(task *distribute.Task) {
 	self.AppConf.Pausetime = task.Pausetime
 	self.AppConf.OutType = task.OutType
 	self.AppConf.DockerCap = task.DockerCap
-	self.AppConf.DockerQueueCap = task.DockerQueueCap
 	self.AppConf.SuccessInherit = task.SuccessInherit
 	self.AppConf.FailureInherit = task.FailureInherit
 	self.AppConf.Limit = task.Limit
@@ -665,7 +676,6 @@ func (self *Logic) setTask(task *distribute.Task) {
 	task.Pausetime = self.AppConf.Pausetime
 	task.OutType = self.AppConf.OutType
 	task.DockerCap = self.AppConf.DockerCap
-	task.DockerQueueCap = self.AppConf.DockerQueueCap
 	task.SuccessInherit = self.AppConf.SuccessInherit
 	task.FailureInherit = self.AppConf.FailureInherit
 	task.Limit = self.AppConf.Limit

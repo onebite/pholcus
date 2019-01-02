@@ -7,10 +7,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/henrylee2cn/pholcus/app/downloader/request"
@@ -21,16 +21,17 @@ import (
 )
 
 type Proxy struct {
-	ipRegexp    *regexp.Regexp
-	proxyRegexp *regexp.Regexp
-	allIps      map[string]string
-	all         map[string]bool
-	online      int
-	usable      map[string]*ProxyForHost
-	ticker      *time.Ticker
-	tickMinute  int64
-	threadPool  chan bool
-	surf        surfer.Surfer
+	ipRegexp           *regexp.Regexp
+	proxyIPTypeRegexp  *regexp.Regexp
+	proxyUrlTypeRegexp *regexp.Regexp
+	allIps             map[string]string
+	all                map[string]bool
+	online             int32
+	usable             map[string]*ProxyForHost
+	ticker             *time.Ticker
+	tickMinute         int64
+	threadPool         chan bool
+	surf               surfer.Surfer
 	sync.Mutex
 }
 
@@ -44,20 +45,21 @@ const (
 
 func New() *Proxy {
 	p := &Proxy{
-		ipRegexp:    regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+`),
-		proxyRegexp: regexp.MustCompile(`http[s]?://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+`),
-		allIps:      map[string]string{},
-		all:         map[string]bool{},
-		usable:      make(map[string]*ProxyForHost),
-		threadPool:  make(chan bool, MAX_THREAD_NUM),
-		surf:        surfer.New(),
+		ipRegexp:           regexp.MustCompile(`[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+`),
+		proxyIPTypeRegexp:  regexp.MustCompile(`https?://([\w]*:[\w]*@)?[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+`),
+		proxyUrlTypeRegexp: regexp.MustCompile(`((https?|ftp):\/\/)?(([^:\n\r]+):([^@\n\r]+)@)?((www\.)?([^/\n\r:]+)):?([0-9]{1,5})?\/?([^?\n\r]+)?\??([^#\n\r]*)?#?([^\n\r]*)`),
+		allIps:             map[string]string{},
+		all:                map[string]bool{},
+		usable:             make(map[string]*ProxyForHost),
+		threadPool:         make(chan bool, MAX_THREAD_NUM),
+		surf:               surfer.New(),
 	}
 	go p.Update()
 	return p
 }
 
 // 代理IP数量
-func (self *Proxy) Count() int {
+func (self *Proxy) Count() int32 {
 	return self.online
 }
 
@@ -71,12 +73,19 @@ func (self *Proxy) Update() *Proxy {
 	b, _ := ioutil.ReadAll(f)
 	f.Close()
 
-	proxys := self.proxyRegexp.FindAllString(string(b), -1)
-	for _, proxy := range proxys {
+	proxysIPType := self.proxyIPTypeRegexp.FindAllString(string(b), -1)
+	for _, proxy := range proxysIPType {
 		self.allIps[proxy] = self.ipRegexp.FindString(proxy)
 		self.all[proxy] = false
-		// fmt.Printf("+ 代理IP %v：%v\n", i, proxy)
 	}
+
+	proxysUrlType := self.proxyUrlTypeRegexp.FindAllString(string(b), -1)
+	for _, proxy := range proxysUrlType {
+		gvalue := self.proxyUrlTypeRegexp.FindStringSubmatch(proxy)
+		self.allIps[proxy] = gvalue[6]
+		self.all[proxy] = false
+	}
+
 	log.Printf(" *     读取代理IP: %v 条\n", len(self.all))
 
 	self.findOnline()
@@ -96,14 +105,15 @@ func (self *Proxy) findOnline() *Proxy {
 			self.all[proxy] = alive
 			self.Unlock()
 			if alive {
-				self.online++
+				atomic.AddInt32(&self.online, 1)
 			}
 			<-self.threadPool
 		}(proxy)
 	}
 	for len(self.threadPool) > 0 {
-		runtime.Gosched()
+		time.Sleep(0.2e9)
 	}
+	self.online = atomic.LoadInt32(&self.online)
 	log.Printf(" *     在线代理IP筛选完成，共计：%v 个\n", self.online)
 
 	return self
@@ -202,7 +212,7 @@ func (self *Proxy) testAndSort(key string, testHost string) (*ProxyForHost, bool
 		}(proxy)
 	}
 	for len(self.threadPool) > 0 {
-		runtime.Gosched()
+		time.Sleep(0.2e9)
 	}
 	if proxyForHost.Len() > 0 {
 		sort.Sort(proxyForHost)
@@ -225,6 +235,11 @@ func (self *Proxy) findUsable(proxy string, testHost string) (alive bool, timede
 		TryTimes:    TRY_TIMES,
 	}
 	req.SetProxy(proxy)
-	_, err := self.surf.Download(req)
+	resp, err := self.surf.Download(req)
+
+	if resp.StatusCode != http.StatusOK {
+		return false, 0
+	}
+
 	return err == nil, time.Since(t0)
 }

@@ -13,7 +13,7 @@ import (
 
 /************************ excel 输出 ***************************/
 func init() {
-	DataOutput["excel"] = func(self *Collector, dataIndex int) (err error) {
+	DataOutput["excel"] = func(self *Collector) (err error) {
 		defer func() {
 			if p := recover(); p != nil {
 				err = fmt.Errorf("%v", p)
@@ -31,7 +31,7 @@ func init() {
 		file = xlsx.NewFile()
 
 		// 添加分类数据工作表
-		for _, datacell := range self.DockerQueue.Dockers[dataIndex] {
+		for _, datacell := range self.dataDocker {
 			var subNamespace = util.FileNameReplace(self.subNamespace(datacell))
 			if _, ok := sheets[subNamespace]; !ok {
 				// 添加工作表
@@ -69,7 +69,7 @@ func init() {
 				row.AddCell().Value = datacell["DownloadTime"].(string)
 			}
 		}
-		folder := config.TEXT_DIR + "/" + cache.StartTime.Format("2006年01月02日 15时04分05秒")
+		folder := config.TEXT_DIR + "/" + cache.StartTime.Format("2006-01-02 150405")
 		filename := fmt.Sprintf("%v/%v__%v-%v.xlsx", folder, util.FileNameReplace(self.namespace()), self.sum[0], self.sum[1])
 
 		// 创建/打开目录

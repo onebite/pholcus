@@ -13,7 +13,7 @@ import (
 
 /************************ CSV 输出 ***************************/
 func init() {
-	DataOutput["csv"] = func(self *Collector, dataIndex int) (err error) {
+	DataOutput["csv"] = func(self *Collector) (err error) {
 		defer func() {
 			if p := recover(); p != nil {
 				err = fmt.Errorf("%v", p)
@@ -23,10 +23,10 @@ func init() {
 			namespace = util.FileNameReplace(self.namespace())
 			sheets    = make(map[string]*csv.Writer)
 		)
-		for _, datacell := range self.DockerQueue.Dockers[dataIndex] {
+		for _, datacell := range self.dataDocker {
 			var subNamespace = util.FileNameReplace(self.subNamespace(datacell))
 			if _, ok := sheets[subNamespace]; !ok {
-				folder := config.TEXT_DIR + "/" + cache.StartTime.Format("2006年01月02日 15时04分05秒") + "/" + joinNamespaces(namespace, subNamespace)
+				folder := config.TEXT_DIR + "/" + cache.StartTime.Format("2006-01-02 150405") + "/" + joinNamespaces(namespace, subNamespace)
 				filename := fmt.Sprintf("%v/%v-%v.csv", folder, self.sum[0], self.sum[1])
 
 				// 创建/打开目录
@@ -44,6 +44,12 @@ func init() {
 					logs.Log.Error("%v", err)
 					continue
 				}
+				defer func() {
+					// 发送缓存数据流
+					sheets[subNamespace].Flush()
+					// 关闭文件
+					file.Close()
+				}()
 
 				file.WriteString("\xEF\xBB\xBF") // 写入UTF-8 BOM
 
@@ -53,13 +59,6 @@ func init() {
 					th = append(th, "当前链接", "上级链接", "下载时间")
 				}
 				sheets[subNamespace].Write(th)
-
-				defer func(file *os.File) {
-					// 发送缓存数据流
-					sheets[subNamespace].Flush()
-					// 关闭文件
-					file.Close()
-				}(file)
 			}
 
 			row := []string{}

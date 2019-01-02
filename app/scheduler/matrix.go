@@ -1,10 +1,10 @@
 package scheduler
 
 import (
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/henrylee2cn/pholcus/app/aid/history"
 	"github.com/henrylee2cn/pholcus/app/downloader/request"
@@ -25,6 +25,7 @@ type Matrix struct {
 	failures        map[string]*request.Request // 历史及本次失败请求
 	tempHistoryLock sync.RWMutex
 	failureLock     sync.Mutex
+	readys      	chan *request.Request        //就绪队列
 	sync.Mutex
 }
 
@@ -37,6 +38,7 @@ func newMatrix(spiderName, spiderSubName string, maxPage int64) *Matrix {
 		history:     history.New(spiderName, spiderSubName),
 		tempHistory: make(map[string]bool),
 		failures:    make(map[string]*request.Request),
+		readys: 	 make(chan *request.Request,1024),
 	}
 	if cache.Task.Mode != status.SERVER {
 		matrix.history.ReadSuccess(cache.Task.OutType, cache.Task.SuccessInherit)
@@ -46,36 +48,178 @@ func newMatrix(spiderName, spiderSubName string, maxPage int64) *Matrix {
 	return matrix
 }
 
-// 添加请求到队列，并发安全
+func (self *Matrix) PushAndChoose(req *request.Request) (*request.Request){
+	// 禁止并发，降低请求积存量
+	self.Lock()
+	defer self.Unlock()
+
+	waited := false
+
+	if sdl.checkStatus(status.STOP) {
+		return nil
+	}
+
+	for sdl.checkStatus(status.PAUSE) {
+		waited = true
+		time.Sleep(time.Second)
+	}
+
+	// 达到请求上限，停止该规则运行
+	if self.maxPage >= 0 {
+		return nil
+	}
+
+	if waited && sdl.checkStatus(status.STOP) {
+		return nil
+	}
+
+	// 不可重复下载的req
+	if !req.IsReloadable() {
+		// 已存在成功记录时退出
+		if self.hasHistory(req.Unique()) {
+			return nil
+		}
+		// 添加到临时记录
+		self.insertTempHistory(req.Unique())
+	}
+
+	var priority = req.GetPriority()
+
+	// 初始化该蜘蛛下该优先级队列
+	if _, found := self.reqs[priority]; !found {
+		self.priorities = append(self.priorities, priority)
+		sort.Ints(self.priorities) // 从小到大排序
+		self.reqs[priority] = []*request.Request{}
+	}
+
+	// 添加请求到队列
+	self.reqs[priority] = append(self.reqs[priority], req)
+
+	// 按优先级从高到低取出到就绪队列
+	for i := len(self.reqs) - 1; i >= 0; i-- {
+		idx := self.priorities[i]
+		if len(self.reqs[idx]) > 0 {
+			ready := self.reqs[idx][0]
+			self.reqs[idx] = self.reqs[idx][1:]
+
+			return ready
+		}
+	}
+
+	// 大致限制加入队列的请求量，并发情况下应该会比maxPage多
+	atomic.AddInt64(&self.maxPage, 1)
+	return nil
+}
+
 func (self *Matrix) Push(req *request.Request) {
+	//将sleep放到锁外，避免出现长时间等待
+	// 资源使用过多时等待，降低请求积存量  这里控制最大协程的数量，控制入队速率，等待放在锁里面，同时控制出队速率
+	for atomic.LoadInt32(&self.resCount) > sdl.avgRes() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	if sdl.checkStatus(status.STOP) {
 		return
+	}
+
+	ready := self.PushAndChoose(req)
+
+	if ready == nil {
+		return
+	}
+
+	self.readys <- ready
+}
+
+func (self *Matrix) Push3(req *request.Request) {
+	//将sleep放到锁外，避免出现长时间等待
+	//waited := self.pauseWait()
+	// 资源使用过多时等待，降低请求积存量  这里控制最大协程的数量，控制入队速率，等待放在锁里面，同时控制出队速率
+	waited := false
+	for atomic.LoadInt32(&self.resCount) > sdl.avgRes() {
+		waited = true
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// 禁止并发，降低请求积存量
 	self.Lock()
 	defer self.Unlock()
 
+	if sdl.checkStatus(status.STOP) {
+		return
+	}
+
+	for sdl.checkStatus(status.PAUSE) {
+		waited = true
+		time.Sleep(time.Second)
+	}
+
 	// 达到请求上限，停止该规则运行
 	if self.maxPage >= 0 {
 		return
 	}
 
-	// 暂停状态时等待，降低请求积存量
+	if waited && sdl.checkStatus(status.STOP) {
+		return
+	}
+
+	// 不可重复下载的req
+	if !req.IsReloadable() {
+		// 已存在成功记录时退出
+		if self.hasHistory(req.Unique()) {
+			return
+		}
+		// 添加到临时记录
+		self.insertTempHistory(req.Unique())
+	}
+
+	var priority = req.GetPriority()
+
+	// 初始化该蜘蛛下该优先级队列
+	if _, found := self.reqs[priority]; !found {
+		self.priorities = append(self.priorities, priority)
+		sort.Ints(self.priorities) // 从小到大排序
+		self.reqs[priority] = []*request.Request{}
+	}
+
+	// 添加请求到队列
+	self.reqs[priority] = append(self.reqs[priority], req)
+
+	// 大致限制加入队列的请求量，并发情况下应该会比maxPage多
+	atomic.AddInt64(&self.maxPage, 1)
+}
+
+// 添加请求到队列，并发安全
+func (self *Matrix) Push2(req *request.Request) {
+	// 禁止并发，降低请求积存量
+	self.Lock()
+	defer self.Unlock()
+
+	if sdl.checkStatus(status.STOP) {
+		return
+	}
+
+	// 达到请求上限，停止该规则运行
+	if self.maxPage >= 0 {
+		return
+	}
+
+	// 暂停状态时等待，降低请求积存量 暂停放到锁里面，添加队列会影响到出队速度
 	waited := false
 	for sdl.checkStatus(status.PAUSE) {
 		waited = true
-		runtime.Gosched()
+		time.Sleep(time.Second)
 	}
 	if waited && sdl.checkStatus(status.STOP) {
 		return
 	}
 
-	// 资源使用过多时等待，降低请求积存量
+	// 资源使用过多时等待，降低请求积存量  这里控制最大协程的数量，控制入队速率，等待放在锁里面，同时控制出队速率
+	// rescount达到最大值，如果push线程拿锁，rescount越来越大，pull将一直拿不到数据
 	waited = false
-	for self.resCount > sdl.avgRes() {
+	for atomic.LoadInt32(&self.resCount) > sdl.avgRes() {
 		waited = true
-		runtime.Gosched()
+		time.Sleep(100 * time.Millisecond)
 	}
 	if waited && sdl.checkStatus(status.STOP) {
 		return
@@ -112,8 +256,31 @@ func (self *Matrix) Pull() (req *request.Request) {
 	if !sdl.checkStatus(status.RUN) {
 		return
 	}
+
+	for req = range self.readys {
+		if req == nil {
+			return
+		}
+		break
+	}
+
+
+	if sdl.useProxy {
+		req.SetProxy(sdl.proxy.GetOne(req.GetUrl()))
+	} else {
+		req.SetProxy("")
+	}
+
+	return
+}
+
+// 从队列取出请求，不存在时返回nil，并发安全
+func (self *Matrix) Pull2() (req *request.Request) {
 	self.Lock()
 	defer self.Unlock()
+	if !sdl.checkStatus(status.RUN) {
+		return
+	}
 	// 按优先级从高到低取出请求
 	for i := len(self.reqs) - 1; i >= 0; i-- {
 		idx := self.priorities[i]
@@ -181,7 +348,7 @@ func (self *Matrix) CanStop() bool {
 	if self.maxPage >= 0 {
 		return true
 	}
-	if self.resCount != 0 {
+	if atomic.LoadInt32(&self.resCount) != 0 {
 		return false
 	}
 	if self.Len() > 0 {
@@ -225,8 +392,13 @@ func (self *Matrix) TryFlushFailure() {
 
 // 等待处理中的请求完成
 func (self *Matrix) Wait() {
-	for self.resCount != 0 {
-		runtime.Gosched()
+	if sdl.checkStatus(status.STOP) {
+		// println("Wait$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+		// 主动终止任务时，不等待运行中任务自然结束
+		return
+	}
+	for atomic.LoadInt32(&self.resCount) != 0 {
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -265,19 +437,15 @@ func (self *Matrix) setFailures(reqs map[string]*request.Request) {
 	}
 }
 
-// 主动终止任务时，进行收尾工作
-// 如：持久化保存历史失败记录，清空对象
-func (self *Matrix) windup() {
-	self.Lock()
-	self.reqs = make(map[int][]*request.Request)
-	self.priorities = []int{}
-	self.tempHistory = make(map[string]bool)
+// // 主动终止任务时，进行收尾工作
+// func (self *Matrix) windup() {
+// 	self.Lock()
 
-	// 持久化保存历史失败记录
-	for _, req := range self.failures {
-		self.history.UpsertFailure(req)
-	}
-	self.failures = make(map[string]*request.Request)
+// 	self.reqs = make(map[int][]*request.Request)
+// 	self.priorities = []int{}
+// 	self.tempHistory = make(map[string]bool)
 
-	self.Unlock()
-}
+// 	self.failures = make(map[string]*request.Request)
+
+// 	self.Unlock()
+// }

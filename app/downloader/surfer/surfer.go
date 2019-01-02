@@ -17,27 +17,43 @@ package surfer
 
 import (
 	"net/http"
-	"os"
+	"net/http/cookiejar"
 	"sync"
 )
 
 var (
-	surf          Surfer
-	phantom       Surfer
-	once_surf     sync.Once
-	once_phantom  sync.Once
-	tempJsDir     = "./tmp"
-	phantomjsFile = os.Getenv("GOPATH") + `\src\github.com\henrylee2cn\surfer\phantomjs\phantomjs`
+	surf         Surfer
+	phantom      Surfer
+	chrome       Surfer
+	sel          Surfer
+	once_surf    sync.Once
+	once_phantom sync.Once
+	once_chromdp sync.Once
+	once_selenium sync.Once
+	tempJsDir    = "./tmp"
+	// phantomjsFile = filepath.Clean(path.Join(os.Getenv("GOPATH"), `/src/github.com/henrylee2cn/surfer/phantomjs/phantomjs`))
+	phantomjsFile = `./phantomjs`
+	cookieJar, _  = cookiejar.New(nil)
 )
 
 func Download(req Request) (resp *http.Response, err error) {
 	switch req.GetDownloaderID() {
 	case SurfID:
-		once_surf.Do(func() { surf = New() })
+		once_surf.Do(func() { surf = New(cookieJar) })
 		resp, err = surf.Download(req)
 	case PhomtomJsID:
-		once_phantom.Do(func() { phantom = NewPhantom(phantomjsFile, tempJsDir) })
+		once_phantom.Do(func() { phantom = NewPhantom(phantomjsFile, tempJsDir, cookieJar) })
 		resp, err = phantom.Download(req)
+	case ChromeDP:
+		once_chromdp.Do(func() {
+			chrome = NewChromeDP()
+			resp, err = chrome.Download(req)
+		})
+	case SeleniumID:
+		once_selenium.Do(func() {
+			sel = NewSel()
+			resp, err = sel.Download(req)
+		})
 	}
 	return
 }

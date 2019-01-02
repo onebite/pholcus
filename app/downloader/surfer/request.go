@@ -47,6 +47,8 @@ type (
 		GetRedirectTimes() int
 		// select Surf ro PhomtomJS
 		GetDownloaderID() int
+		//2018-12-02 need temp data
+		GetTemp(key string, defaultValue interface{}) interface{}
 	}
 
 	// 默认实现的Request
@@ -89,6 +91,8 @@ type (
 const (
 	SurfID             = 0               // Surf下载器标识符
 	PhomtomJsID        = 1               // PhomtomJs下载器标识符
+	ChromeDP           = 2               // ChromeDP模拟下载器
+	SeleniumID         = 3               // SeleniumID
 	DefaultMethod      = "GET"           // 默认请求方法
 	DefaultDialTimeout = 2 * time.Minute // 默认请求服务器超时
 	DefaultConnTimeout = 2 * time.Minute // 默认下载超时
@@ -126,7 +130,7 @@ func (self *DefaultRequest) prepare() {
 		self.RetryPause = DefaultRetryPause
 	}
 
-	if self.DownloaderID != PhomtomJsID {
+	if self.DownloaderID > SeleniumID {
 		self.DownloaderID = SurfID
 	}
 }
@@ -201,4 +205,10 @@ func (self *DefaultRequest) GetRedirectTimes() int {
 func (self *DefaultRequest) GetDownloaderID() int {
 	self.once.Do(self.prepare)
 	return self.DownloaderID
+}
+
+// select Surf ro PhomtomJS
+func (self *DefaultRequest) GetTemp(key string, defaultValue interface{}) interface{} {
+	self.once.Do(self.prepare)
+	return nil
 }

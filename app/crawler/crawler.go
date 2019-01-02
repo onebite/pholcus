@@ -1,7 +1,9 @@
 package crawler
 
 import (
+	"bytes"
 	"math/rand"
+	"runtime"
 	"time"
 
 	"github.com/henrylee2cn/pholcus/app/downloader"
@@ -18,6 +20,7 @@ type (
 		Init(*spider.Spider) Crawler //初始化采集引擎
 		Run()                        //运行任务
 		Stop()                       //主动终止
+		CanStop() bool               //能否终止
 		GetId() int                  //获取引擎ID
 	}
 	crawler struct {
@@ -32,15 +35,14 @@ type (
 func New(id int) Crawler {
 	return &crawler{
 		id:         id,
-		Pipeline:   pipeline.New(),
 		Downloader: downloader.SurferDownloader,
 	}
 }
 
 func (self *crawler) Init(sp *spider.Spider) Crawler {
 	self.Spider = sp.ReqmatrixInit()
-	self.Pipeline.Init(sp)
-	self.pause[0] = cache.Task.Pausetime / 2
+	self.Pipeline = pipeline.New(sp)
+	self.pause[0] = sp.Pausetime / 2
 	if self.pause[0] > 0 {
 		self.pause[1] = self.pause[0] * 3
 	} else {
@@ -74,28 +76,31 @@ func (self *crawler) Run() {
 func (self *crawler) Stop() {
 	// 主动崩溃爬虫运行协程
 	self.Spider.Stop()
+	self.Pipeline.Stop()
 }
 
 func (self *crawler) run() {
 	for {
 		// 队列中取出一条请求并处理
-		if req := self.GetOne(); req == nil {
+		req := self.GetOne()
+		if req == nil {
 			// 停止任务
 			if self.Spider.CanStop() {
 				break
 			}
-
-		} else {
-			// 执行请求
-			self.UseOne()
-			go func(req *request.Request) {
-				defer func() {
-					self.FreeOne()
-				}()
-				logs.Log.Debug(" *     Start: %v", req.GetUrl())
-				self.Process(req)
-			}(req)
+			time.Sleep(20 * time.Millisecond)
+			continue
 		}
+
+		// 执行请求
+		self.UseOne()
+		go func() {
+			defer func() {
+				self.FreeOne()
+			}()
+			logs.Log.Debug(" *     Start: %v", req.GetUrl())
+			self.Process(req)
+		}()
 
 		// 随机等待
 		self.sleep()
@@ -108,13 +113,40 @@ func (self *crawler) run() {
 // core processer
 func (self *crawler) Process(req *request.Request) {
 	var (
-		ctx     = self.Downloader.Download(self.Spider, req) // download page
 		downUrl = req.GetUrl()
+		sp      = self.Spider
 	)
+	defer func() {
+		if p := recover(); p != nil {
+			if sp.IsStopping() {
+				// println("Process$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+				return
+			}
+			// 返回是否作为新的失败请求被添加至队列尾部
+			if sp.DoHistory(req, false) {
+				// 统计失败数
+				cache.PageFailCount()
+			}
+			// 提示错误
+			stack := make([]byte, 4<<10) //4KB
+			length := runtime.Stack(stack, true)
+			start := bytes.Index(stack, []byte("/src/runtime/panic.go"))
+			stack = stack[start:length]
+			start = bytes.Index(stack, []byte("\n")) + 1
+			stack = stack[start:]
+			if end := bytes.Index(stack, []byte("\ngoroutine ")); end != -1 {
+				stack = stack[:end]
+			}
+			stack = bytes.Replace(stack, []byte("\n"), []byte("\r\n"), -1)
+			logs.Log.Error(" *     Panic  [process][%s]: %s\r\n[TRACE]\r\n%s", downUrl, p, stack)
+		}
+	}()
+
+	var ctx = self.Downloader.Download(sp, req) // download page
 
 	if err := ctx.GetError(); err != nil {
 		// 返回是否作为新的失败请求被添加至队列尾部
-		if self.Spider.DoHistory(req, false) {
+		if sp.DoHistory(req, false) {
 			// 统计失败数
 			cache.PageFailCount()
 		}
@@ -123,26 +155,24 @@ func (self *crawler) Process(req *request.Request) {
 		return
 	}
 
-	defer func() {
-		if err := recover(); err != nil {
-			if activeStop, _ := err.(string); activeStop == spider.ACTIVE_STOP {
-				return
-			}
-			// 返回是否作为新的失败请求被添加至队列尾部
-			if self.Spider.DoHistory(req, false) {
-				// 统计失败数
-				cache.PageFailCount()
-			}
-			// 提示错误
-			logs.Log.Error(" *     Panic  [process][%v]: %v\n", downUrl, err)
-		}
-	}()
-
 	// 过程处理，提炼数据
 	ctx.Parse(req.GetRuleName())
 
+	// 该条请求文件结果存入pipeline
+	for _, f := range ctx.PullFiles() {
+		if self.Pipeline.CollectFile(f) != nil {
+			break
+		}
+	}
+	// 该条请求文本结果存入pipeline
+	for _, item := range ctx.PullItems() {
+		if self.Pipeline.CollectData(item) != nil {
+			break
+		}
+	}
+
 	// 处理成功请求记录
-	self.Spider.DoHistory(req, true)
+	sp.DoHistory(req, true)
 
 	// 统计成功页数
 	cache.PageSuccCount()
@@ -150,14 +180,6 @@ func (self *crawler) Process(req *request.Request) {
 	// 提示抓取成功
 	logs.Log.Informational(" *     Success: %v\n", downUrl)
 
-	// 该条请求文本结果存入pipeline
-	for _, item := range ctx.PullItems() {
-		self.Pipeline.CollectData(item)
-	}
-	// 该条请求文件结果存入pipeline
-	for _, f := range ctx.PullFiles() {
-		self.Pipeline.CollectFile(f)
-	}
 	// 释放ctx准备复用
 	spider.PutContext(ctx)
 }

@@ -12,11 +12,11 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html/charset"
 
 	"github.com/henrylee2cn/pholcus/app/downloader/request"
 	"github.com/henrylee2cn/pholcus/app/pipeline/collector/data"
+	"github.com/henrylee2cn/pholcus/common/goquery"
 	"github.com/henrylee2cn/pholcus/common/util"
 	"github.com/henrylee2cn/pholcus/logs"
 )
@@ -54,11 +54,14 @@ func GetContext(sp *Spider, req *request.Request) *Context {
 }
 
 func PutContext(ctx *Context) {
+	if ctx.Response != nil {
+		ctx.Response.Body.Close() // too many open files bug remove
+		ctx.Response = nil
+	}
 	ctx.items = ctx.items[:0]
 	ctx.files = ctx.files[:0]
 	ctx.spider = nil
 	ctx.Request = nil
-	ctx.Response = nil
 	ctx.text = nil
 	ctx.dom = nil
 	ctx.err = nil
@@ -215,9 +218,46 @@ func (self *Context) Output(item interface{}, ruleName ...string) {
 	self.Unlock()
 }
 
+// 定制输出内容
+//
+func (self *Context) ContentOutput(bytes []byte,nameOrExt ...string) {
+	_, s := path.Split(self.GetUrl())
+	n := strings.Split(s, "?")[0]
+
+	var baseName, ext string
+
+	fcd := strings.TrimSpace(self.Response.Header.Get("Content-Disposition"))
+
+	if fcd != "" {
+		s = fcd[strings.LastIndex(fcd,"=")+1:]
+	}
+
+	if len(nameOrExt) > 0 {
+		p, n := path.Split(nameOrExt[0])
+		ext = path.Ext(n)
+		if baseName2 := strings.TrimSuffix(n, ext); baseName2 != "" {
+			baseName = p + baseName2
+		}
+	}
+	if baseName == "" {
+		baseName = strings.TrimSuffix(n, path.Ext(n))
+	}
+	if ext == "" {
+		ext = path.Ext(n)
+	}
+	if ext == "" {
+		ext = ".txt"
+	}
+
+	// 保存到文件临时队列
+	self.Lock()
+	self.files = append(self.files, data.GetFileCell(self.GetRuleName(), baseName+ext, bytes))
+	self.Unlock()
+}
+
 // 输出文件。
-// name指定文件名，为空时默认保持原文件名不变。
-func (self *Context) FileOutput(name ...string) {
+// nameOrExt指定文件名或仅扩展名，为空时默认保持原文件名（包括扩展名）不变。
+func (self *Context) FileOutput(nameOrExt ...string) {
 	// 读取完整文件流
 	bytes, err := ioutil.ReadAll(self.Response.Body)
 	self.Response.Body.Close()
@@ -230,15 +270,23 @@ func (self *Context) FileOutput(name ...string) {
 	_, s := path.Split(self.GetUrl())
 	n := strings.Split(s, "?")[0]
 
-	baseName := strings.Split(n, ".")[0]
+	var baseName, ext string
 
-	var ext string
-	if len(name) > 0 {
-		p, n := path.Split(name[0])
-		if baseName2 := strings.Split(n, ".")[0]; baseName2 != "" {
+	fcd := strings.TrimSpace(self.Response.Header.Get("Content-Disposition"))
+
+	if fcd != "" {
+		s = fcd[strings.LastIndex(fcd,"=")+1:]
+	}
+
+	if len(nameOrExt) > 0 {
+		p, n := path.Split(nameOrExt[0])
+		ext = path.Ext(n)
+		if baseName2 := strings.TrimSuffix(n, ext); baseName2 != "" {
 			baseName = p + baseName2
 		}
-		ext = path.Ext(n)
+	}
+	if baseName == "" {
+		baseName = strings.TrimSuffix(n, path.Ext(n))
 	}
 	if ext == "" {
 		ext = path.Ext(n)
@@ -306,10 +354,17 @@ func (self *Context) Aid(aid map[string]interface{}, ruleName ...string) interfa
 
 	_, rule, found := self.getRule(ruleName...)
 	if !found {
-		logs.Log.Error("蜘蛛 %s 调用Aid()时，指定的规则名不存在！", self.spider.GetName())
+		if len(ruleName) > 0 {
+			logs.Log.Error("调用蜘蛛 %s 不存在的规则: %s", self.spider.GetName(), ruleName[0])
+		} else {
+			logs.Log.Error("调用蜘蛛 %s 的Aid()时未指定的规则名", self.spider.GetName())
+		}
 		return nil
 	}
-
+	if rule.AidFunc == nil {
+		logs.Log.Error("蜘蛛 %s 的规则 %s 未定义AidFunc", self.spider.GetName(), ruleName[0])
+		return nil
+	}
 	return rule.AidFunc(self, aid)
 }
 
@@ -325,6 +380,10 @@ func (self *Context) Parse(ruleName ...string) *Context {
 	}
 	if !found {
 		self.spider.RuleTree.Root(self)
+		return self
+	}
+	if rule.ParseFunc == nil {
+		logs.Log.Error("蜘蛛 %s 的规则 %s 未定义ParseFunc", self.spider.GetName(), ruleName[0])
 		return self
 	}
 	rule.ParseFunc(self)
@@ -376,6 +435,8 @@ func (self *Context) ResetText(body string) *Context {
 
 // 获取下载错误。
 func (self *Context) GetError() error {
+	// 若已主动终止任务，则崩溃爬虫协程
+	self.spider.tryPanic()
 	return self.err
 }
 
